@@ -2,33 +2,66 @@ from __future__ import annotations
 
 import datetime as dt
 import html
-import json
+import re
 from email.utils import format_datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape as xml_escape
 
-API_URL = "https://newalbumreleases.net/wp-json/wp/v2/posts?categories=34&per_page=20&orderby=date&order=desc&_fields=id,date,date_gmt,link,title,excerpt,content,modified"
-
+SITE_URL = "https://newalbumreleases.net/category/cat/"
 SITE_TITLE = "New Album Releases - Archive"
-SITE_LINK = "https://newalbumreleases.net/category/cat/"
 SITE_DESCRIPTION = "Latest album posts from New Album Releases"
 
 OUT_DIR = Path("site")
-FEED_FILE = OUT_DIR / "feed.xml"
+FEED_FILE = OUT_DIR / "Archive.xml"
 INDEX_FILE = OUT_DIR / "index.html"
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://newalbumreleases.net/",
+}
 
-def fetch_json(url: str):
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+POST_RE = re.compile(
+    r'<div class="single" id="post-(?P<id>\d+)">.*?'
+    r'<h2><a href="(?P<link>[^"]+)"[^>]*>(?P<title>.*?)</a></h2>.*?'
+    r'<div class="date">.*?On (?P<month>[A-Za-z]+) - (?P<day>\d{1,2}) - (?P<year>\d{4})</div>',
+    re.S | re.I,
+)
+
+
+def fetch_text(url: str) -> str:
+    req = Request(url, headers=HEADERS)
     with urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return resp.read().decode("utf-8", errors="replace")
 
 
-def parse_iso(value: str | None) -> dt.datetime:
-    if not value:
-        return dt.datetime.now(dt.timezone.utc)
-    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+def parse_posts(page_html: str) -> list[dict]:
+    posts: list[dict] = []
+
+    for m in POST_RE.finditer(page_html):
+        title = html.unescape(re.sub(r"<[^>]+>", "", m.group("title"))).strip()
+        link = html.unescape(m.group("link")).strip()
+        post_id = m.group("id").strip()
+
+        date_text = f"{m.group('month')} {m.group('day')} {m.group('year')}"
+        pub_dt = dt.datetime.strptime(date_text, "%B %d %Y").replace(tzinfo=dt.timezone.utc)
+
+        posts.append(
+            {
+                "id": post_id,
+                "title": title,
+                "link": link,
+                "pub_dt": pub_dt,
+            }
+        )
+
+    return posts
 
 
 def cdata(text: str) -> str:
@@ -36,18 +69,16 @@ def cdata(text: str) -> str:
 
 
 def build_rss(posts: list[dict]) -> str:
-    now = dt.datetime.now(dt.timezone.utc)
-    last_build = format_datetime(now)
+    last_build = format_datetime(dt.datetime.now(dt.timezone.utc))
 
     items_xml = []
     for post in posts:
-        title = html.unescape(post.get("title", {}).get("rendered", "")).strip()
-        link = post.get("link", "").strip()
-        post_id = post.get("id")
-        pub_dt = parse_iso(post.get("date_gmt") or post.get("date"))
-        pub_date = format_datetime(pub_dt.astimezone(dt.timezone.utc))
-        excerpt = post.get("excerpt", {}).get("rendered", "") or ""
-        content = post.get("content", {}).get("rendered", "") or ""
+        title = post["title"]
+        link = post["link"]
+        post_id = post["id"]
+        pub_date = format_datetime(post["pub_dt"])
+
+        description = f"New Album Releases archive post: {title}"
 
         items_xml.append(
             f"""
@@ -56,18 +87,15 @@ def build_rss(posts: list[dict]) -> str:
       <link>{xml_escape(link)}</link>
       <guid isPermaLink="false">{xml_escape(str(post_id))}</guid>
       <pubDate>{xml_escape(pub_date)}</pubDate>
-      <description>{cdata(excerpt)}</description>
-      <content:encoded>{cdata(content)}</content:encoded>
+      <description>{cdata(description)}</description>
     </item>"""
         )
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0"
-  xmlns:content="http://purl.org/rss/1.0/modules/content/"
-  xmlns:atom="http://www.w3.org/2005/Atom">
+<rss version="2.0">
   <channel>
     <title>{xml_escape(SITE_TITLE)}</title>
-    <link>{xml_escape(SITE_LINK)}</link>
+    <link>{xml_escape(SITE_URL)}</link>
     <description>{xml_escape(SITE_DESCRIPTION)}</description>
     <lastBuildDate>{xml_escape(last_build)}</lastBuildDate>
     <language>en-us</language>
@@ -86,16 +114,17 @@ def build_index() -> str:
   </head>
   <body>
     <h1>{html.escape(SITE_TITLE)}</h1>
-    <p><a href="feed.xml">RSS feed</a></p>
-    <p>Source: <a href="{html.escape(SITE_LINK)}">{html.escape(SITE_LINK)}</a></p>
+    <p><a href="Archive.xml">Archive.xml</a></p>
+    <p>Source: <a href="{html.escape(SITE_URL)}">{html.escape(SITE_URL)}</a></p>
   </body>
 </html>
 """
 
 
-def main():
+def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    posts = fetch_json(API_URL)
+    page_html = fetch_text(SITE_URL)
+    posts = parse_posts(page_html)
     FEED_FILE.write_text(build_rss(posts), encoding="utf-8")
     INDEX_FILE.write_text(build_index(), encoding="utf-8")
     print(f"Wrote {FEED_FILE} and {INDEX_FILE}")
