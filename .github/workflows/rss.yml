@@ -3,22 +3,49 @@ name: Build RSS
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'
+    - cron: "0 * * * *"
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source repository
+        uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Run generator
         run: python generate_feed.py
+
+      - name: Check out feeds repository
+        uses: actions/checkout@v4
+        with:
+          repository: Pkashe/feeds
+          token: ${{ secrets.FEEDS_REPO_TOKEN }}
+          path: feeds-repo
+
+      - name: Copy generated feed
+        run: |
+          cp site/Archive.xml feeds-repo/Archive.xml
+
+      - name: Commit and push updated feed
+        working-directory: feeds-repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Archive.xml
+
+          if git diff --cached --quiet; then
+            echo "No feed changes to commit."
+          else
+            git commit -m "Update Archive.xml"
+            git push
+          fi
 
       - name: Upload generated files
         uses: actions/upload-artifact@v4
