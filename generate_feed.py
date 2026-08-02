@@ -9,10 +9,10 @@ from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape as xml_escape
 
 
-# GitHub downloads the page through the Cloudflare Worker.
-SITE_URL = "https://newalbumreleases-proxy.nikjin12345.workers.dev/"
+# GitHub retrieves the page through Cloudflare.
+FETCH_URL = "https://newalbumreleases-proxy.nikjin12345.workers.dev/"
 
-# This remains the original source shown inside the RSS feed and index page.
+# Original page shown in the RSS feed.
 SOURCE_PAGE_URL = "https://newalbumreleases.net/category/cat/"
 
 SITE_TITLE = "New Album Releases - Archive"
@@ -28,49 +28,130 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-POST_RE = re.compile(
-    r'<div class="single" id="post-(?P<id>\d+)">.*?'
-    r'<h2><a href="(?P<link>[^"]+)"[^>]*>(?P<title>.*?)</a></h2>.*?'
-    r'<div class="date">.*?On (?P<month>[A-Za-z]+) - '
-    r'(?P<day>\d{1,2}) - (?P<year>\d{4})</div>',
-    re.S | re.I,
+
+# Finds a post container even when the id and class attributes
+# appear in a different order.
+POST_START_RE = re.compile(
+    r"""
+    <div\b
+    (?=[^>]*\bid=["']post-(?P<id>\d+)["'])
+    (?=[^>]*\bclass=["'][^"']*\bsingle\b[^"']*["'])
+    [^>]*>
+    """,
+    re.I | re.X,
+)
+
+TITLE_RE = re.compile(
+    r"""
+    <h2\b[^>]*>
+    \s*
+    <a\b
+    [^>]*\bhref=["'](?P<link>[^"']+)["']
+    [^>]*>
+    (?P<title>.*?)
+    </a>
+    \s*
+    </h2>
+    """,
+    re.I | re.S | re.X,
+)
+
+DATE_RE = re.compile(
+    r"""
+    <div\b
+    [^>]*\bclass=["'][^"']*\bdate\b[^"']*["']
+    [^>]*>
+    .*?
+    \bOn\s+
+    (?P<month>[A-Za-z]+)
+    \s*-\s*
+    (?P<day>\d{1,2})
+    \s*-\s*
+    (?P<year>\d{4})
+    .*?
+    </div>
+    """,
+    re.I | re.S | re.X,
 )
 
 
 def fetch_text(url: str) -> str:
     """Download and decode the source HTML."""
-    req = Request(url, headers=HEADERS)
+    request = Request(url, headers=HEADERS)
 
-    with urlopen(req, timeout=30) as response:
+    with urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8", errors="replace")
 
 
+def clean_text(value: str) -> str:
+    """Remove HTML tags, decode entities and normalise spaces."""
+    without_tags = re.sub(r"<[^>]+>", "", value)
+
+    return html.unescape(without_tags).replace("\xa0", " ").strip()
+
+
 def parse_posts(page_html: str) -> list[dict]:
-    """Extract album post details from the archive page."""
+    """Extract album posts from the archive page."""
     posts: list[dict] = []
+    starts = list(POST_START_RE.finditer(page_html))
 
-    for match in POST_RE.finditer(page_html):
-        title = html.unescape(
-            re.sub(r"<[^>]+>", "", match.group("title"))
-        ).strip()
+    print(f"Found {len(starts)} potential post containers.")
 
-        link = html.unescape(match.group("link")).strip()
-        post_id = match.group("id").strip()
+    for index, start_match in enumerate(starts):
+        block_start = start_match.start()
+
+        if index + 1 < len(starts):
+            block_end = starts[index + 1].start()
+        else:
+            block_end = len(page_html)
+
+        post_html = page_html[block_start:block_end]
+
+        title_match = TITLE_RE.search(post_html)
+        date_match = DATE_RE.search(post_html)
+
+        if not title_match:
+            print(
+                "Skipping post "
+                f"{start_match.group('id')}: title was not found."
+            )
+            continue
+
+        if not date_match:
+            print(
+                "Skipping post "
+                f"{start_match.group('id')}: date was not found."
+            )
+            continue
+
+        post_id = start_match.group("id").strip()
+        title = clean_text(title_match.group("title"))
+        link = html.unescape(title_match.group("link")).strip()
 
         date_text = (
-            f"{match.group('month')} "
-            f"{match.group('day')} "
-            f"{match.group('year')}"
+            f"{date_match.group('month')} "
+            f"{date_match.group('day')} "
+            f"{date_match.group('year')}"
         )
 
-        pub_dt = dt.datetime.strptime(
-            date_text,
-            "%B %d %Y",
-        ).replace(tzinfo=dt.timezone.utc)
+        try:
+            pub_dt = dt.datetime.strptime(
+                date_text,
+                "%B %d %Y",
+            ).replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            print(
+                f"Skipping post {post_id}: "
+                f"unrecognised date {date_text!r}."
+            )
+            continue
 
         posts.append(
             {
@@ -86,10 +167,11 @@ def parse_posts(page_html: str) -> list[dict]:
 
 def cdata(text: str) -> str:
     """Safely wrap text in an XML CDATA section."""
-    return "<![CDATA[" + text.replace(
-        "]]>",
-        "]]]]><![CDATA[>",
-    ) + "]]>"
+    return (
+        "<![CDATA["
+        + text.replace("]]>", "]]]]><![CDATA[>")
+        + "]]>"
+    )
 
 
 def build_rss(posts: list[dict]) -> str:
@@ -136,7 +218,7 @@ def build_rss(posts: list[dict]) -> str:
 
 
 def build_index() -> str:
-    """Create the simple GitHub Pages index page."""
+    """Create the GitHub Pages index."""
     source_url = html.escape(SOURCE_PAGE_URL)
 
     return f"""<!doctype html>
@@ -160,7 +242,11 @@ def build_index() -> str:
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    page_html = fetch_text(SITE_URL)
+    page_html = fetch_text(FETCH_URL)
+
+    print(f"Downloaded {len(page_html)} characters.")
+    print(f"Downloaded through: {FETCH_URL}")
+
     posts = parse_posts(page_html)
 
     if not posts:
@@ -179,8 +265,7 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(f"Downloaded source through: {SITE_URL}")
-    print(f"Found {len(posts)} album posts.")
+    print(f"Successfully parsed {len(posts)} album posts.")
     print(f"Wrote {FEED_FILE} and {INDEX_FILE}")
 
 
