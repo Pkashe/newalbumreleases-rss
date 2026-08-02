@@ -8,7 +8,13 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape as xml_escape
 
-SITE_URL = "https://newalbumreleases.net/category/cat/"
+
+# GitHub downloads the page through the Cloudflare Worker.
+SITE_URL = "https://newalbumreleases-proxy.nikjin12345.workers.dev/"
+
+# This remains the original source shown inside the RSS feed and index page.
+SOURCE_PAGE_URL = "https://newalbumreleases.net/category/cat/"
+
 SITE_TITLE = "New Album Releases - Archive"
 SITE_DESCRIPTION = "Latest album posts from New Album Releases"
 
@@ -24,33 +30,47 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://newalbumreleases.net/",
 }
 
 POST_RE = re.compile(
     r'<div class="single" id="post-(?P<id>\d+)">.*?'
     r'<h2><a href="(?P<link>[^"]+)"[^>]*>(?P<title>.*?)</a></h2>.*?'
-    r'<div class="date">.*?On (?P<month>[A-Za-z]+) - (?P<day>\d{1,2}) - (?P<year>\d{4})</div>',
+    r'<div class="date">.*?On (?P<month>[A-Za-z]+) - '
+    r'(?P<day>\d{1,2}) - (?P<year>\d{4})</div>',
     re.S | re.I,
 )
 
 
 def fetch_text(url: str) -> str:
+    """Download and decode the source HTML."""
     req = Request(url, headers=HEADERS)
-    with urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+
+    with urlopen(req, timeout=30) as response:
+        return response.read().decode("utf-8", errors="replace")
 
 
 def parse_posts(page_html: str) -> list[dict]:
+    """Extract album post details from the archive page."""
     posts: list[dict] = []
 
-    for m in POST_RE.finditer(page_html):
-        title = html.unescape(re.sub(r"<[^>]+>", "", m.group("title"))).strip()
-        link = html.unescape(m.group("link")).strip()
-        post_id = m.group("id").strip()
+    for match in POST_RE.finditer(page_html):
+        title = html.unescape(
+            re.sub(r"<[^>]+>", "", match.group("title"))
+        ).strip()
 
-        date_text = f"{m.group('month')} {m.group('day')} {m.group('year')}"
-        pub_dt = dt.datetime.strptime(date_text, "%B %d %Y").replace(tzinfo=dt.timezone.utc)
+        link = html.unescape(match.group("link")).strip()
+        post_id = match.group("id").strip()
+
+        date_text = (
+            f"{match.group('month')} "
+            f"{match.group('day')} "
+            f"{match.group('year')}"
+        )
+
+        pub_dt = dt.datetime.strptime(
+            date_text,
+            "%B %d %Y",
+        ).replace(tzinfo=dt.timezone.utc)
 
         posts.append(
             {
@@ -65,20 +85,30 @@ def parse_posts(page_html: str) -> list[dict]:
 
 
 def cdata(text: str) -> str:
-    return "<![CDATA[" + text.replace("]]>", "]]]]><![CDATA[>") + "]]>"
+    """Safely wrap text in an XML CDATA section."""
+    return "<![CDATA[" + text.replace(
+        "]]>",
+        "]]]]><![CDATA[>",
+    ) + "]]>"
 
 
 def build_rss(posts: list[dict]) -> str:
-    last_build = format_datetime(dt.datetime.now(dt.timezone.utc))
+    """Create the RSS 2.0 document."""
+    last_build = format_datetime(
+        dt.datetime.now(dt.timezone.utc)
+    )
 
-    items_xml = []
+    items_xml: list[str] = []
+
     for post in posts:
         title = post["title"]
         link = post["link"]
         post_id = post["id"]
         pub_date = format_datetime(post["pub_dt"])
 
-        description = f"New Album Releases archive post: {title}"
+        description = (
+            f"New Album Releases archive post: {title}"
+        )
 
         items_xml.append(
             f"""
@@ -95,7 +125,7 @@ def build_rss(posts: list[dict]) -> str:
 <rss version="2.0">
   <channel>
     <title>{xml_escape(SITE_TITLE)}</title>
-    <link>{xml_escape(SITE_URL)}</link>
+    <link>{xml_escape(SOURCE_PAGE_URL)}</link>
     <description>{xml_escape(SITE_DESCRIPTION)}</description>
     <lastBuildDate>{xml_escape(last_build)}</lastBuildDate>
     <language>en-us</language>
@@ -106,8 +136,11 @@ def build_rss(posts: list[dict]) -> str:
 
 
 def build_index() -> str:
+    """Create the simple GitHub Pages index page."""
+    source_url = html.escape(SOURCE_PAGE_URL)
+
     return f"""<!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <title>{html.escape(SITE_TITLE)}</title>
@@ -115,7 +148,10 @@ def build_index() -> str:
   <body>
     <h1>{html.escape(SITE_TITLE)}</h1>
     <p><a href="Archive.xml">Archive.xml</a></p>
-    <p>Source: <a href="{html.escape(SITE_URL)}">{html.escape(SITE_URL)}</a></p>
+    <p>
+      Source:
+      <a href="{source_url}">{source_url}</a>
+    </p>
   </body>
 </html>
 """
@@ -123,10 +159,28 @@ def build_index() -> str:
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     page_html = fetch_text(SITE_URL)
     posts = parse_posts(page_html)
-    FEED_FILE.write_text(build_rss(posts), encoding="utf-8")
-    INDEX_FILE.write_text(build_index(), encoding="utf-8")
+
+    if not posts:
+        raise RuntimeError(
+            "The source page downloaded successfully, "
+            "but no album posts were found."
+        )
+
+    FEED_FILE.write_text(
+        build_rss(posts),
+        encoding="utf-8",
+    )
+
+    INDEX_FILE.write_text(
+        build_index(),
+        encoding="utf-8",
+    )
+
+    print(f"Downloaded source through: {SITE_URL}")
+    print(f"Found {len(posts)} album posts.")
     print(f"Wrote {FEED_FILE} and {INDEX_FILE}")
 
 
