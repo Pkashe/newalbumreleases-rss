@@ -6,6 +6,7 @@ import re
 import time
 from email.utils import format_datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape as xml_escape
@@ -93,46 +94,128 @@ def build_fetch_url() -> str:
     return f"{PROXY_URL}?{urlencode({'cache': cache_value})}"
 
 
-def fetch_text(url: str) -> str:
-    """Download and decode the source HTML."""
-    request = Request(
-        url,
-        headers=HEADERS,
-        method="GET",
-    )
+def fetch_text(url: str, retries: int = 5) -> str:
+    """Download and decode the source HTML with retries."""
 
-    with urlopen(request, timeout=60) as response:
-        status = getattr(response, "status", 200)
+    for attempt in range(1, retries + 1):
+        request = Request(
+            url,
+            headers=HEADERS,
+            method="GET",
+        )
 
-        if status != 200:
-            raise RuntimeError(
-                f"Proxy returned HTTP {status}."
+        try:
+            print(
+                f"Download attempt {attempt} of {retries}..."
             )
 
-        raw_data = response.read()
+            with urlopen(request, timeout=60) as response:
+                status = getattr(response, "status", 200)
 
-        print(
-            "Proxy response headers:"
-        )
+                if status != 200:
+                    raise RuntimeError(
+                        f"Proxy returned HTTP {status}."
+                    )
 
-        for header_name in (
-            "date",
-            "age",
-            "cache-control",
-            "cf-cache-status",
-            "content-type",
-        ):
-            header_value = response.headers.get(header_name)
+                raw_data = response.read()
 
-            if header_value:
                 print(
-                    f"  {header_name}: {header_value}"
+                    "Proxy response headers:"
                 )
 
-        return raw_data.decode(
-            "utf-8",
-            errors="replace",
-        )
+                for header_name in (
+                    "date",
+                    "age",
+                    "cache-control",
+                    "cf-cache-status",
+                    "content-type",
+                ):
+                    header_value = response.headers.get(
+                        header_name
+                    )
+
+                    if header_value:
+                        print(
+                            f"  {header_name}: "
+                            f"{header_value}"
+                        )
+
+                return raw_data.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+
+        except HTTPError as error:
+            retryable_codes = {
+                429,
+                500,
+                502,
+                503,
+                504,
+            }
+
+            print(
+                f"HTTP error {error.code}: "
+                f"{error.reason}"
+            )
+
+            if (
+                error.code in retryable_codes
+                and attempt < retries
+            ):
+                wait_seconds = attempt * 10
+
+                print(
+                    f"Temporary server error. "
+                    f"Waiting {wait_seconds} seconds "
+                    "before retrying..."
+                )
+
+                time.sleep(wait_seconds)
+                continue
+
+            raise
+
+        except URLError as error:
+            print(
+                f"Network error: {error.reason}"
+            )
+
+            if attempt < retries:
+                wait_seconds = attempt * 10
+
+                print(
+                    f"Waiting {wait_seconds} seconds "
+                    "before retrying..."
+                )
+
+                time.sleep(wait_seconds)
+                continue
+
+            raise
+
+        except TimeoutError:
+            print(
+                "The request timed out."
+            )
+
+            if attempt < retries:
+                wait_seconds = attempt * 10
+
+                print(
+                    f"Waiting {wait_seconds} seconds "
+                    "before retrying..."
+                )
+
+                time.sleep(wait_seconds)
+                continue
+
+            raise
+
+    raise RuntimeError(
+        "Unable to download the source page "
+        "after multiple attempts."
+    )
 
 
 def clean_text(value: str) -> str:
@@ -228,6 +311,7 @@ def parse_posts(page_html: str) -> list[dict]:
             ).replace(
                 tzinfo=dt.timezone.utc
             )
+
         except ValueError:
             print(
                 f"Skipping post {post_id}: "
